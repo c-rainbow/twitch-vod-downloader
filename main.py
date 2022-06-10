@@ -1,3 +1,4 @@
+from typing import Any, Tuple, Union
 import requests
 import datetime
 import sys
@@ -5,7 +6,8 @@ import json
 import os
 from os import path
 import glob
-from urllib.parse import urlparse
+from urllib.parse import urljoin
+import re
 
 # Load Twitch client ID from .env file
 from dotenv import load_dotenv
@@ -30,143 +32,188 @@ API_HEADERS = {
 
 
 # Get VOD data
-def GetVideoData(video_id: str) -> object:
+def GetVideoData(video_id: str) -> dict[str, Any]:
   video_url = VIDEO_URL.format(video_id=video_id)
   r = requests.get(video_url, headers=API_HEADERS)
   json_data = r.json()
   return json_data
 
 
-# If stream is in progress
-def IsProcessing(video_json: object) -> bool:
-  return False
+# Get text content of the .m3u8 playlist
+def GetPlaylistContent(url: str) -> str:
+  r = requests.get(url)    
+  return r.text
 
 
-def GetUsername(video_json: object) -> str:
-  username = video_json['channel']['name']
+# Get video file HTTP status and content
+def GetFileContent(base_url: str, filename: str) -> Tuple[int, Union[bytes, None]]:
+  url = urljoin(base_url, filename)
+  r = requests.get(url)
+  if r.status_code >= 400:
+    return (r.status_code, None)
+  return (r.status_code, r.content)
+  
+  
+# Get unmuted, original muted file names of a video segment
+# For example, returns (1234-unmuted.ts, 1234.ts, 1234-muted.ts) from '1234-muted.ts'
+def GetPossibleVideoFilenames(filename: str) -> Tuple[str, str, str]:
+  match = re.match(r'\d+', filename)
+  if match is None:
+    raise ValueError('File %s does not start with a number' % filename)
+  
+  index = match.group()  # Returns the numeric part in the beginning
+  return (
+    '%s-unmuted.ts' % index, '%s.ts' % index, '%s-muted.ts' % index
+  )
+    
+
+# Extract streamer's username from the VOD data JSON
+def GetUsername(video_json: dict[str, Any]) -> str:
+  username: str = video_json['channel']['name']
   return username
 
 
-def GetBaseUrlsByResolution(video_json):
-  preview_url = video_json['animated_preview_url']
-  print('preview_url:', preview_url)
-  storyboard_index = preview_url.find('storyboards/')
-  base_url = preview_url[:storyboard_index]
-  resolutions = list(video_json['resolutions'].keys()) + ['audio_only']
+# List of available resolutions (ex: '160p30', '480p30', '720p60', 'chunked', etc)
+def GetResolutions(video_json: dict[str, Any]) -> list[str]:
+  resolution_dict: dict[str, str] = video_json['resolutions']
+  return list(resolution_dict.keys()) + ['audio_only']
+
+
+# If stream is in progress
+def IsProcessing(video_json: dict[str, Any]) -> bool:
+  template_preview_url = video_json['preview']['template']
+  return '404_processing' in template_preview_url
+
+
+# Base URLs by resolution.
+# The .m3u8 playlist and .ts segment files exist under these paths
+def GetBaseUrlsByResolution(video_json) -> dict[str, str]:
+  animated_preview_url: str = video_json['animated_preview_url']
+  storyboard_index = animated_preview_url.find('/storyboards/')
   
-  base_urls_by_resolution = {resolution: base_url + resolution + '/'  for resolution in resolutions}
+  base_url: str = animated_preview_url[:storyboard_index]
+  resolutions = GetResolutions(video_json)
+  base_urls_by_resolution = {
+    resolution: '%s/%s/' % (base_url, resolution) for resolution in resolutions
+  }
+
   return base_urls_by_resolution
 
-def GetPlaylistUrl(base_url):
+
+# Playlist URLs for a base URL. Simply appends 'index-dvr.m3u8' at the end
+def GetPlaylistUrl(base_url: str) -> str:
   return base_url + 'index-dvr.m3u8'
 
-def GetVideoFileUrls(base_url, playlist_content):
+
+# Names of all .ts files in the playlist
+def GetVideoFilenames(playlist_content: str) -> list[str]:
   lines = playlist_content.split('\n')
-  lines = [base_url + line for line in lines if line != '' and not line.startswith('#')]
-  return lines
+  filenames = [
+    line.strip() for line in lines
+    if line.strip() != '' and not line.startswith('#')
+  ]
+  return filenames
 
-def GetFilenameFromUrl(video_url):
-  last_slash = video_url.rfind('/')
-  filename = video_url[last_slash+1:]
-  return filename
 
-def TryDownloadingVideo(video_url):
-  filename = GetFilenameFromUrl(video_url)
-
-  if filename.endswith('-unmuted.ts'):
-    # Try unmuted version first
-    r = requests.get(video_url)
-    if r.status_code >= 400:
-      print('Downloading unmuted URL failed with', r.status_code, 'for', filename, '. Trying muted URL...')
-      video_url = video_url.replace('-unmuted.ts', '-muted.ts')
-    else:
-      return r.content
+# Check if the segment is already downloaded, whether muted or not.
+def IsDownloaded(dir_path: str, filename: str):
+  unmuted_filename, original_filename, muted_filename = GetPossibleVideoFilenames(filename)
   
-  if filename.endswith('-muted.ts'):
-    # Try muted URL
-    r = requests.get(video_url)
-    if r.status_code >= 400:
-      print('Downloading unmuted URL failed with', r.status_code, 'for', filename)
-      video_url = video_url.replace('-unmuted.ts', '.ts')
-    else:
-      return r.content
+  for name in (unmuted_filename, original_filename, muted_filename):
+    file_path = os.path.join(dir_path, name)
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+      return True
+  
+  return False
+
+# Download the video file. Try to download unmuted version if it exists.
+# For example, there can be 1234.ts, 1234-muted.ts, and 1234-unmuted.ts.
+# We need to first try -unmuted.ts, then .ts, and then -muted.ts.
+def TryDownloadingSingleVideo(base_url: str, filename: str) -> Union[Tuple[str, bytes], Tuple[None, None]]:
+  unmuted_filename, original_filename, muted_filename = GetPossibleVideoFilenames(filename)
+  
+  # TODO: Try downloading 2-3 times?
+  
+  # First, try the unmuted filename
+  status_code, content = GetFileContent(base_url, unmuted_filename)
+  if content is None:
+      print('Downloading the unmuted video URL failed with', status_code, 'for', filename)
+  else:
+    return (unmuted_filename, content)
+  
+  # Second, try the original filename
+  status_code, content = GetFileContent(base_url, original_filename)
+  if content is None:
+      print('Downloading the original video URL failed with', status_code, 'for', filename)
+  else:
+    return (original_filename, content)
     
-  # Lastly, try normal URL
-  r = requests.get(video_url)
-  if r.status_code >= 400:
-    print('Downloading failed with', r.status_code, 'for', filename)
-    return None
-  return r.content
+  # Lastly, try the muted filename
+  status_code, content = GetFileContent(base_url, muted_filename)
+  if content is None:
+      print('Downloading the muted video URL failed with', status_code, 'for', filename)
+  else:
+    return (muted_filename, content)
+
+  # If the video could not be downloaded, return None
+  return (None, None)
 
 
-def main():
+def PrepareForDownload() -> Tuple[str, str, list[str]]:
     # Video
-    video_id = VIDEO_ID
-    video_json = GetVideoData(video_id)
-    print(json.dumps(video_json))
+    video_json = GetVideoData(VIDEO_ID)
+    #print(json.dumps(video_json))
+    
     username = GetUsername(video_json)
     print(username)
     
+    resolutions = GetResolutions(video_json)
+    print(resolutions)
     
+    processing = IsProcessing(video_json)
+    print(processing)
     
-    
-    return
     base_urls_by_resolution = GetBaseUrlsByResolution(video_json)
     print(base_urls_by_resolution)
 
     base_url = base_urls_by_resolution[VIDEO_QUALITY]
-    playlist_url = GetPlaylistUrl(base_url)
-    playlist_content = requests.get(playlist_url).text
+    playlist_url = GetPlaylistUrl(base_url)    
+    playlist_content = GetPlaylistContent(playlist_url)
+    video_filenames = GetVideoFilenames(playlist_content)
 
-    file_urls = GetVideoFileUrls(base_url, playlist_content)
+    dir_path = './downloaded/{username}/{video_id}/{quality}'.format(
+      username=username, video_id=VIDEO_ID, quality=VIDEO_QUALITY)
+    os.makedirs(dir_path, exist_ok=True)
 
-    dir_path = './{username}/{video_id}/'.format(username=username, video_id=video_id)
-
-    directory = os.makedirs('./{username}/{video_id}/'.format(username=username, video_id=video_id), exist_ok=True)
-
+    # Write VOD info, for record
     info_file_path = os.path.join(dir_path, 'info.json')
     with open(info_file_path, 'w', encoding='utf8') as f:
       json.dump(video_json, f, indent=2, ensure_ascii=False)
 
+    # Write playlist content, for record
     playlist_file_path = os.path.join(dir_path, 'playlist.m3u8')
     with open(playlist_file_path, 'w', encoding='utf8') as f:
       f.write(playlist_content)
+      
+    return (base_url, dir_path, video_filenames)
 
-    video_urls_path = os.path.join(dir_path, 'video_urls.txt')
-    with open(video_urls_path, 'w', encoding='utf8') as f:
-      f.write('\n'.join(file_urls))
-
-    return username, video_id
     
-def Download(username, video_id):
-  dir_path = './{username}/{video_id}/'.format(username=username, video_id=video_id)
-  video_urls_path = os.path.join(dir_path, 'video_urls.txt')
-  with open(video_urls_path, 'r', encoding='utf8') as f:
-    lines = f.read().split('\n')
-    
-  if START_INDEX:
-    if END_INDEX is not None:
-        lines = lines[START_INDEX:END_INDEX]
-    else:
-        lines = lines[START_INDEX:]
-  
-  for file_url in lines:
-    filename = GetFilenameFromUrl(file_url)
-    file_path = os.path.join(dir_path, filename)
-    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-        print('Exists:', filename)
+def DownloadVideos(base_url: str, dir_path: str, filenames: list[str]):  
+  for filename in filenames:
+    # Check if the video segment is already downloaded
+    if IsDownloaded(dir_path, filename):
+        print('File already exists:', filename)
         continue
-        
-    content = TryDownloadingVideo(file_url)
-    if content is not None:
+    
+    downloaded_filename, content = TryDownloadingSingleVideo(base_url, filename)
+    if downloaded_filename is not None and content is not None:
+      file_path = os.path.join(dir_path, downloaded_filename)
       with open(file_path, 'wb') as f:
         f.write(content)
-        print('Downloaded', filename)
+        print('Downloaded video segment', downloaded_filename)
   
 
 def CombineFiles(path):
-  #path = dir_path = './{username}/{video_id}/'.format(username=STREAMER_USERNAME, video_id=VIDEO_ID)
-
   filelist = glob.glob(path + '*.ts')
   print(filelist)
   
@@ -181,8 +228,7 @@ def CombineFiles(path):
 
 
 if __name__ == '__main__':
-  #username, video_id = main()
-  main()
-  #Download(username, video_id)
+  base_url, dir_path, video_filenames = PrepareForDownload()
+  DownloadVideos(base_url, dir_path, video_filenames)
   
   # CombineFiles()
