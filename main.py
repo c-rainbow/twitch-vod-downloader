@@ -1,7 +1,5 @@
 from typing import Any, Tuple, Union
 import requests
-import datetime
-import sys
 import json
 import os
 from os import path
@@ -214,13 +212,13 @@ def DownloadVideos(base_url: str, dir_path: str, filenames: list[str]):
   
 
 def CombineFiles(path):
-  filelist = glob.glob(path + '*.ts')
+  filelist = glob.glob(os.path.join(path, '*.ts'))
   print(filelist)
   
   if END_INDEX:
     filelist = filelist[START_INDEX:END_INDEX]
 
-  with open(path + 'combined.ts', 'wb') as combined_file:
+  with open(os.path.join(path, 'combined.ts'), 'wb') as combined_file:
     for filename in filelist:
       with open(filename, 'rb') as ts_f:
         ts_content = ts_f.read()
@@ -229,6 +227,6 @@ def CombineFiles(path):
 
 if __name__ == '__main__':
   base_url, dir_path, video_filenames = PrepareForDownload()
-  DownloadVideos(base_url, dir_path, video_filenames)
-  
-  # CombineFiles()
+  #DownloadVideos(base_url, dir_path, video_filenames)
+  print(dir_path)
+  # CombineFiles(dir_path)
