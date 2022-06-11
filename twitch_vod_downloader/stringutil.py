@@ -31,7 +31,7 @@ def GetSegmentIndexes(playlist_content: str) -> List[str]:
 
 # Get URL of m3u8 HLS playlist file from the base address.
 # It is simply 'index-dvr.m3u8'
-def GetPlaylistUrl(self, base_url: str) -> str:
+def GetPlaylistUrl(base_url: str) -> str:
   if base_url.endswith('/'):
     return base_url + 'index-dvr.m3u8'
   else:

@@ -24,7 +24,7 @@ class VodDownloader:
 
   def GetVodInfo(self) -> vod_info.VodInfo:
     url = VOD_URL.format(vod_id=self._vod_id)
-    vod_json = fetch.FetchJson(url, headers=self._GetApiHeader())
+    _, vod_json = fetch.FetchJson(url, headers=self._GetApiHeader())
     return vod_info.VodInfo(vod_json)
   
   def Download(self):
@@ -36,7 +36,7 @@ class VodDownloader:
     base_urls = vod_info.GetBaseUrlsByResolution()
     base_url = base_urls.get(self._quality)
     playlist_url = stringutil.GetPlaylistUrl(base_url)
-    playlist_content = fetch.FetchText(playlist_url)
+    _, playlist_content = fetch.FetchText(playlist_url)
     segment_indexes = stringutil.GetSegmentIndexes(playlist_content)
     
     # Keep track of which segments are downloaded.
@@ -56,13 +56,16 @@ class VodDownloader:
         downloaded_filename, content = self.TryDownloadingSegment(base_url, segment_index)
         if content is None:  # Download failed
           failed_indexes.add(segment_index)
+          print('Download failed for segment', segment_index)
         else:
           downloaded_indexes.add(segment_index)
-          fileutil.WriteToBinaryFile(self.output_path, downloaded_filename, content)
+          fileutil.WriteToBinaryFile(self._output_path, downloaded_filename, content)
+          print('Download successful for segment', segment_index, 'to', downloaded_filename)
 
       # Downloaded all segments in unfinished_indexes, but the stream is still in progress.
       # Check for new segments every N seconds
       elif vod_info.IsStreamInProgress():
+        print('Stream is still in progress, waiting for more segments')
         # Sleep for N seconds and get new VOD info and playlist content
         time.sleep(SLEEP_DURATION_IN_SECONDS)
         
@@ -70,14 +73,16 @@ class VodDownloader:
         vod_info = self.GetVodInfo()
         
         # Refresh the playlist content, check if there are more indexes
-        playlist_content = fetch.FetchText(playlist_url)
+        _, playlist_content = fetch.FetchText(playlist_url)
         segment_indexes = stringutil.GetSegmentIndexes(playlist_content)
+        print('Found total', len(segment_indexes), 'indexes')
         for segment_index in segment_indexes:
           if segment_index in downloaded_indexes:
             continue
           if segment_index in failed_indexes:
             continue
-          unfinished_indexes.append(segment_index)      
+          unfinished_indexes.append(segment_index)
+          print('Newly found segment', segment_index)      
   
   # Download the video file. Try to download unmuted version if it exists.
   # For example, there can be 1234.ts, 1234-muted.ts, and 1234-unmuted.ts.
