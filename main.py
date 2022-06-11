@@ -1,4 +1,4 @@
-from typing import Any, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 import requests
 import json
 import os
@@ -44,7 +44,7 @@ def GetPlaylistContent(url: str) -> str:
 
 
 # Get video file HTTP status and content
-def GetFileContent(base_url: str, filename: str) -> Tuple[int, Union[bytes, None]]:
+def GetFileContent(base_url: str, filename: str) -> Tuple[int, Optional[bytes]]:
   url = urljoin(base_url, filename)
   r = requests.get(url)
   if r.status_code >= 400:
@@ -127,7 +127,7 @@ def IsDownloaded(dir_path: str, filename: str):
 # Download the video file. Try to download unmuted version if it exists.
 # For example, there can be 1234.ts, 1234-muted.ts, and 1234-unmuted.ts.
 # We need to first try -unmuted.ts, then .ts, and then -muted.ts.
-def TryDownloadingSingleVideo(base_url: str, filename: str) -> Union[Tuple[str, bytes], Tuple[None, None]]:
+def TryDownloadingSingleVideo(base_url: str, filename: str) -> Tuple[Optional[str], Optional[bytes]]:
   unmuted_filename, original_filename, muted_filename = GetPossibleVideoFilenames(filename)
   
   # TODO: Try downloading 2-3 times?

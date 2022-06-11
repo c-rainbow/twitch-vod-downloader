@@ -1,7 +1,7 @@
 import collections
 import os
 import time
-from typing import Set, Tuple, Union
+from typing import Optional, Set, Tuple
 
 from twitch_vod_downloader import fetch
 from twitch_vod_downloader import fileutil
@@ -10,84 +10,106 @@ from twitch_vod_downloader import vod_info
 
 
 VOD_URL = 'https://api.twitch.tv/v5/videos/{vod_id}'
+DEFAULT_OUTPUT_PATH = './downloaded/{username}/{vod_id}/{quality}'
 
-SLEEP_DURATION_IN_SECONDS = 5.0
+
+# Sleep for this duration before refreshing the playlist
+# when all previous segments were downloaded and more segments were expected.
+#
+# NOTE: Although each segment is around 10 seconds long,
+# the playlist file is often not updated for 30-60 seconds.
+DEFAULT_SLEEP_DURATION_IN_SECONDS = 10.0
 
 
 class VodDownloader:
     
-  def __init__(self, vod_id: str, client_id: str=None, quality: str='chunked', output_path: str=None):
+  def __init__(self, vod_id: str, client_id: str, quality: str='chunked', output_path: Optional[str]=None,
+               sleep_duration: float=DEFAULT_SLEEP_DURATION_IN_SECONDS):
     self._vod_id = vod_id
     self._client_id = client_id
-    self._quality = quality
-    self._output_path = output_path
+    self._resolution = quality
+    self._custom_output_path = output_path
+    self._sleep_duration = sleep_duration
 
-  def GetVodInfo(self) -> vod_info.VodInfo:
+  def FetchVodInfo(self) -> vod_info.VodInfo:
     url = VOD_URL.format(vod_id=self._vod_id)
-    _, vod_json = fetch.FetchJson(url, headers=self._GetApiHeader())
+    status_code, vod_json = fetch.FetchJson(url, headers=self._GetApiHeader())
+    if not vod_json:
+      raise Exception('Fetching VOD info JSON failed with status %s' % status_code)
+
     return vod_info.VodInfo(vod_json)
   
   def Download(self):
-    vod_info = self.GetVodInfo()
-    # Lazily set output path
-    self._output_path = self._CreateOutputDirectory(vod_info)
+    vod_info = self.FetchVodInfo()
+
+    # Get the base URL for the desired VOD ID and resolution
+    base_url = vod_info.GetBaseUrlByResolution(self._resolution)
+    if not base_url:
+      all_resolutions = ', '.join(vod_info.GetResolutions())
+      raise Exception('Resolution "%s" is invalid. Valid ones are: %s' % (self._resolution, all_resolutions))
+
+    # Create output path directory
+    output_path = self._custom_output_path or self._GetDefaultOutputPath(vod_info)
+    os.makedirs(output_path, exist_ok=True)
     
-    # Get base URLs and the content of the .m3u8 HLS playlist.
-    base_urls = vod_info.GetBaseUrlsByResolution()
-    base_url = base_urls.get(self._quality)
+    # Get all segment indexes from the content of the .m3u8 HLS playlist
     playlist_url = stringutil.GetPlaylistUrl(base_url)
-    _, playlist_content = fetch.FetchText(playlist_url)
-    segment_indexes = stringutil.GetSegmentIndexes(playlist_content)
+    segment_indexes = fetch.FetchSegmentIndexes(playlist_url)
     
     # Keep track of which segments are downloaded.
     downloaded_indexes: Set[str] = set()
-    failed_indexes: Set[str] = set()
-    unfinished_indexes: collections.deque[str] = collections.deque(segment_indexes)
+    failed_indexes: Set[str] = set()  # TODO: Is there a need for two sets?
+    unfinished_indexes = collections.deque(segment_indexes)
     
-    while len(unfinished_indexes) or vod_info.IsStreamInProgress():
-      if len(unfinished_indexes):
+    # The loop should repeat until all segments are downloaded and the stream is over.
+    while unfinished_indexes or vod_info.IsStreamInProgress():
+      # Download unprocessed segments before checking for more
+      if unfinished_indexes:
         segment_index = unfinished_indexes.popleft()
         
         # Skip if the segment is already downloaded
-        if fileutil.SegmentExists(self._output_path, segment_index):
+        existing_filename = fileutil.GetExistingSegment(output_path, segment_index)
+        if existing_filename:
           downloaded_indexes.add(segment_index)
+          print('Segment file', existing_filename, 'already exists. Skipping...')
           continue
         
+        # Download the segment
         downloaded_filename, content = self.TryDownloadingSegment(base_url, segment_index)
         if content is None:  # Download failed
           failed_indexes.add(segment_index)
           print('Download failed for segment', segment_index)
         else:
           downloaded_indexes.add(segment_index)
-          fileutil.WriteToBinaryFile(self._output_path, downloaded_filename, content)
+          fileutil.WriteBinary(output_path, downloaded_filename, content)
           print('Download successful for segment', segment_index, 'to', downloaded_filename)
 
       # Downloaded all segments in unfinished_indexes, but the stream is still in progress.
       # Check for new segments every N seconds
       elif vod_info.IsStreamInProgress():
-        print('Stream is still in progress, waiting for more segments')
+        print('Stream is in progress. Checking for more segments after', self._sleep_duration, 'seconds...')
+
         # Sleep for N seconds and get new VOD info and playlist content
-        time.sleep(SLEEP_DURATION_IN_SECONDS)
+        time.sleep(self._sleep_duration)
         
         # Update VOD info to check if the stream is still in progress
-        vod_info = self.GetVodInfo()
+        vod_info = self.FetchVodInfo()
         
         # Refresh the playlist content, check if there are more indexes
-        _, playlist_content = fetch.FetchText(playlist_url)
-        segment_indexes = stringutil.GetSegmentIndexes(playlist_content)
-        print('Found total', len(segment_indexes), 'indexes')
+        segment_indexes = fetch.FetchSegmentIndexes(playlist_url)
+        print('Found total', len(segment_indexes), 'segment indexes in the playlist')
+
+        # Add all new segment indexes to the queue
         for segment_index in segment_indexes:
-          if segment_index in downloaded_indexes:
-            continue
-          if segment_index in failed_indexes:
+          if segment_index in downloaded_indexes or segment_index in failed_indexes:
             continue
           unfinished_indexes.append(segment_index)
-          print('Newly found segment', segment_index)      
+          print('Newly found segment', segment_index, 'is added to the queue') 
   
   # Download the video file. Try to download unmuted version if it exists.
   # For example, there can be 1234.ts, 1234-muted.ts, and 1234-unmuted.ts.
   # We need to first try -unmuted.ts, then .ts, and then -muted.ts.
-  def TryDownloadingSegment(self, base_url: str, segment_index: str) -> Union[Tuple[str, bytes], Tuple[None, None]]:
+  def TryDownloadingSegment(self, base_url: str, segment_index: str) -> Tuple[Optional[str], Optional[bytes]]:
     unmuted_filename, original_filename, muted_filename = stringutil.GetSegmentFilenames(segment_index)
     
     # TODO: Try downloading 2-3 times?
@@ -111,16 +133,11 @@ class VodDownloader:
     return (None, None)
   
   # Create output directory for the downloaded VODs and other metadata
-  def _CreateOutputDirectory(self, vod_info: vod_info.VodInfo) -> str:
-    if self._output_path:
-      os.makedirs(self._output_path, exist_ok=True)  
-      return self._output_path
-    else:
-      username = vod_info.GetUsername()
-      dir_path = './downloaded/{username}/{vod_id}/{quality}'.format(
-          username=username, vod_id=self._vod_id, quality=self._quality)
-      os.makedirs(dir_path, exist_ok=True)
-      return dir_path
+  def _GetDefaultOutputPath(self, vod_info: vod_info.VodInfo) -> str:
+    username = vod_info.GetUsername()
+    output_path = DEFAULT_OUTPUT_PATH.format(
+        username=username, vod_id=self._vod_id, quality=self._resolution)
+    return output_path
   
   def _GetApiHeader(self) -> dict[str, str]:
     return {
